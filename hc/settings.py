@@ -267,6 +267,9 @@ PING_BODY_LIMIT = envint("PING_BODY_LIMIT", "10000")
 # then we need to bump up DATA_UPLOAD_MAX_MEMORY_SIZE too:
 if PING_BODY_LIMIT and PING_BODY_LIMIT > 2621440:
     DATA_UPLOAD_MAX_MEMORY_SIZE = PING_BODY_LIMIT
+
+# Maximum number of checks allowed in a single bulk API operation
+BULK_LIMIT = envint("BULK_LIMIT", "500")
 _site_root_parts = urlparse(SITE_ROOT)
 LOGIN_URL = f"{_site_root_parts.path}/accounts/login/"
 STATIC_URL = f"{_site_root_parts.path}/static/"

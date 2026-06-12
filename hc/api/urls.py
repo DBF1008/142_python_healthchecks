@@ -51,6 +51,10 @@ api_urls = [
     path("checks/<sha1:unique_key>", views.get_check_by_unique_key),
     path("checks/<uuid:code>/pause", views.pause, name="hc-api-pause"),
     path("checks/<uuid:code>/resume", views.resume, name="hc-api-resume"),
+    path("checks/bulk/pause", views.bulk_pause, name="hc-api-bulk-pause"),
+    path("checks/bulk/resume", views.bulk_resume, name="hc-api-bulk-resume"),
+    path("checks/bulk/delete", views.bulk_delete, name="hc-api-bulk-delete"),
+    path("checks/bulk/update", views.bulk_update, name="hc-api-bulk-update"),
     path(
         "notifications/<uuid:code>/status",
         views.notification_status,

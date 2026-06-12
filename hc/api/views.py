@@ -8,7 +8,7 @@ from datetime import timedelta as td
 from email import message_from_bytes
 from ipaddress import ip_address
 from typing import Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from cronsim import CronSim, CronSimError
 from django.conf import settings
@@ -47,6 +47,19 @@ from hc.lib.tz import all_timezones, legacy_timezones
 class BadChannelException(Exception):
     def __init__(self, message: str):
         self.message = message
+
+
+class BulkError(Exception):
+    """Raised inside a transaction.atomic() block to trigger a rollback.
+
+    Carries an HTTP status code so the calling view can build an error response.
+    Must be allowed to propagate out of the atomic block; catching it *inside*
+    the block and returning would commit any partial changes.
+    """
+
+    def __init__(self, message: str, status: int = 400):
+        self.message = message
+        self.status = status
 
 
 def guess_kind(schedule: str) -> str:
@@ -140,6 +153,21 @@ class Spec(BaseModel):
         return None
 
 
+class BulkSelector(BaseModel):
+    """Validates the request body for bulk pause/resume/delete operations.
+
+    Size and ownership checks happen later in _resolve_bulk (which reads
+    settings.BULK_LIMIT at runtime, so it stays overridable in tests).
+    """
+
+    checks: list[UUID]
+
+
+class BulkSpec(BulkSelector, Spec):
+    """Request body for bulk update: a list of checks plus the same updatable
+    fields as the single-check Spec."""
+
+
 CUSTOM_ERRORS = {
     "too_long": "%s is too long",
     "string_too_long": "%s is too long",
@@ -154,6 +182,8 @@ CUSTOM_ERRORS = {
     "cron_syntax": "%s is not a valid cron or OnCalendar expression",
     "tz_syntax": "%s is not a valid timezone",
     "time_delta_type": "%s is not a number",
+    "uuid_type": "%s is not a valid uuid",
+    "uuid_parsing": "%s is not a valid uuid",
 }
 
 
@@ -591,6 +621,152 @@ def resume(request: ApiRequest, code: UUID) -> HttpResponse:
     check.save()
 
     return JsonResponse(check.to_dict(v=request.v))
+
+
+def _resolve_bulk(request: ApiRequest, codes: list[UUID]) -> list[Check]:
+    """Lock and return the requested checks, enforcing batch size and ownership.
+
+    Must be called inside a transaction.atomic() block. Raises BulkError (which
+    should be allowed to propagate out of the block, rolling it back) if the
+    batch is empty, exceeds settings.BULK_LIMIT, or references a check that does
+    not exist or belongs to a different project.
+    """
+    if not codes:
+        raise BulkError("checks list must not be empty")
+    if len(codes) > settings.BULK_LIMIT:
+        raise BulkError(f"too many checks (max {settings.BULK_LIMIT})")
+
+    q = Check.objects.select_for_update().filter(
+        code__in=set(codes), project=request.project
+    )
+    checks = list(q)
+    found = {check.code for check in checks}
+    for code in codes:
+        if code not in found:
+            raise BulkError(f"check not found: {code}", status=404)
+
+    return checks
+
+
+@cors("POST")
+@csrf_exempt
+@authorize
+def bulk_pause(request: ApiRequest) -> HttpResponse:
+    try:
+        spec = BulkSelector.model_validate(request.json, strict=True)
+    except ValidationError as e:
+        return JsonResponse({"error": format_first_error(e)}, status=400)
+
+    try:
+        with transaction.atomic():
+            checks = _resolve_bulk(request, spec.checks)
+            for check in checks:
+                # Skip checks that are already paused (matches single pause)
+                if check.status == "paused":
+                    continue
+                # Track the status change for correct downtime calculation
+                check.create_flip("paused", mark_as_processed=True)
+                check.status = "paused"
+                check.last_start = None
+                check.alert_after = None
+                check.save()
+
+            # Clearing next_nag_date is a project-level effect, do it once
+            request.project.update_next_nag_dates()
+            result = [check.to_dict(v=request.v) for check in checks]
+    except BulkError as e:
+        return JsonResponse({"error": e.message}, status=e.status)
+
+    return JsonResponse({"checks": result})
+
+
+@cors("POST")
+@csrf_exempt
+@authorize
+def bulk_resume(request: ApiRequest) -> HttpResponse:
+    try:
+        spec = BulkSelector.model_validate(request.json, strict=True)
+    except ValidationError as e:
+        return JsonResponse({"error": format_first_error(e)}, status=400)
+
+    try:
+        with transaction.atomic():
+            checks = _resolve_bulk(request, spec.checks)
+            # Validate everything first, so we don't resume part of the batch
+            # before discovering a check that cannot be resumed.
+            for check in checks:
+                if check.status != "paused":
+                    raise BulkError(f"check is not paused: {check.code}", status=409)
+
+            for check in checks:
+                check.create_flip("new", mark_as_processed=True)
+                check.status = "new"
+                check.last_start = None
+                check.last_ping = None
+                check.alert_after = None
+                check.save()
+
+            result = [check.to_dict(v=request.v) for check in checks]
+    except BulkError as e:
+        return JsonResponse({"error": e.message}, status=e.status)
+
+    return JsonResponse({"checks": result})
+
+
+@cors("POST")
+@csrf_exempt
+@authorize
+def bulk_delete(request: ApiRequest) -> HttpResponse:
+    try:
+        spec = BulkSelector.model_validate(request.json, strict=True)
+    except ValidationError as e:
+        return JsonResponse({"error": format_first_error(e)}, status=400)
+
+    try:
+        with transaction.atomic():
+            checks = _resolve_bulk(request, spec.checks)
+            # Serialize before deleting, while the objects still exist
+            result = [check.to_dict(v=request.v) for check in checks]
+            ids = [check.id for check in checks]
+            # Rename so the checks cannot be pinged during deletion. The
+            # select_for_update lock in _resolve_bulk blocks concurrent pings
+            # until this transaction commits, so a single delete (without the
+            # retry logic in Check.rename_and_delete) is sufficient here.
+            for check in checks:
+                Check.objects.filter(id=check.id).update(
+                    code=uuid4(), slug=str(uuid4())
+                )
+            Check.objects.filter(id__in=ids).delete()
+    except BulkError as e:
+        return JsonResponse({"error": e.message}, status=e.status)
+
+    return JsonResponse({"checks": result})
+
+
+@cors("POST")
+@csrf_exempt
+@authorize
+def bulk_update(request: ApiRequest) -> HttpResponse:
+    try:
+        spec = BulkSpec.model_validate(request.json, strict=True)
+    except ValidationError as e:
+        return JsonResponse({"error": format_first_error(e)}, status=400)
+
+    try:
+        with transaction.atomic():
+            checks = _resolve_bulk(request, spec.checks)
+            for check in checks:
+                _update(check, spec, request.v)
+            result = [check.to_dict(v=request.v) for check in checks]
+    except BadChannelException as e:
+        # _update raises this before mutating the check, but other checks
+        # earlier in the loop may already be modified, so we rely on the
+        # exception propagating out of the atomic block to roll everything back.
+        return JsonResponse({"error": e.message}, status=400)
+    except BulkError as e:
+        return JsonResponse({"error": e.message}, status=e.status)
+
+    return JsonResponse({"checks": result})
 
 
 @cors("GET")
