@@ -213,6 +213,10 @@ class Check(models.Model):
     has_confirmation_link = models.BooleanField(default=False)
     alert_after = models.DateTimeField(null=True, blank=True, editable=False)
     status = models.CharField(max_length=6, choices=STATUSES, default="new")
+    # The status sendalerts last sent (or decided to send) a notification for.
+    # Used for notification dedup during flap suppression. An empty string means
+    # "no notification sent yet".
+    last_notified_status = models.CharField(max_length=8, blank=True, default="")
 
     # Used to pass downtime data to report templates. Not persisted to db.
     past_downtimes: list[DowntimeRecord] | None = None
@@ -666,6 +670,18 @@ class Check(models.Model):
         flip.new_status = new_status
         flip.reason = reason
         flip.save()
+
+    def is_flapping(self, frozen_now: datetime) -> bool:
+        """Return True if this check has flipped status too often recently.
+
+        A check is "flapping" if it accumulated FLAP_THRESHOLD or more flips
+        within the last FLAP_WINDOW seconds. This counts all flips (processed or
+        not), because we care about the true flip frequency, not the
+        notification state.
+        """
+        window_start = frozen_now - td(seconds=settings.FLAP_WINDOW)
+        recent = self.flip_set.filter(created__gte=window_start).count()
+        return recent >= settings.FLAP_THRESHOLD
 
 
 class PingDict(TypedDict):

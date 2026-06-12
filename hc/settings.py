@@ -332,6 +332,16 @@ S3_SECURE = envbool("S3_SECURE", "True")
 # (example: "localhost:8125")
 STATSD_HOST = os.getenv("STATSD_HOST")
 
+# Alert flapping detection (used by the sendalerts command).
+# A check that flips status FLAP_THRESHOLD or more times within FLAP_WINDOW
+# seconds is considered "flapping". While a check is flapping, sendalerts holds
+# back its notifications and only sends one notification for the final, settled
+# status. FLAP_MAX_SUPPRESS caps how long notifications can be held back, so a
+# check that flaps indefinitely still eventually gets a notification.
+FLAP_THRESHOLD = int(os.getenv("FLAP_THRESHOLD", "5"))
+FLAP_WINDOW = int(os.getenv("FLAP_WINDOW", "300"))
+FLAP_MAX_SUPPRESS = int(os.getenv("FLAP_MAX_SUPPRESS", "3600"))
+
 # Integrations
 
 # Apprise
