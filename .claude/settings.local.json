@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 manage.py test hc.accounts.tests.test_login hc.accounts.tests.test_login_totp hc.accounts.tests.test_sudo_mode hc.accounts.tests.test_signup hc.integrations.telegram.tests.test_notify hc.integrations.signal.tests.test_notify hc.integrations.po.tests.test_notify hc.integrations.ntfy.tests.test_notify hc.api.tests.test_get_ping_body -v 2)"
+    ]
+  }
+}

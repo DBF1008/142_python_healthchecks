@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from datetime import timedelta as td
 
 from django.test.utils import override_settings
@@ -71,3 +72,41 @@ class TokenBucketTestCase(BaseTestCase):
         TokenBucket.record_s3_get_object_error()
         obj.refresh_from_db()
         self.assertTrue(obj.tokens < 0)
+
+    def test_concurrent_authorize_accounts_for_all_tokens(self) -> None:
+        """Concurrent authorize() calls must not lose token deductions.
+
+        This test exercises select_for_update() row-level locking, which
+        is only effective on PostgreSQL / MySQL.  SQLite silently ignores
+        FOR UPDATE and serialises all writes, so the test is skipped there.
+        """
+        from django.db import connection
+
+        if connection.vendor == "sqlite":
+            self.skipTest("select_for_update() is a no-op on SQLite")
+
+        num_threads = 20
+        barrier = threading.Barrier(num_threads)
+        results: list[bool] = []
+        lock = threading.Lock()
+
+        def worker() -> None:
+            barrier.wait(timeout=5)
+            r = TokenBucket.authorize("concurrent-test", 20, 3600)
+            with lock:
+                results.append(r)
+
+        threads = [threading.Thread(target=worker) for _ in range(num_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        successes = sum(1 for r in results if r)
+        # Starting tokens = 1.0, cost per call = 1/20 = 0.05.
+        # Exactly 20 calls should succeed (20 * 0.05 = 1.0).
+        self.assertEqual(successes, 20)
+
+        obj = TokenBucket.objects.get(value="concurrent-test")
+        expected = 1.0 - successes * (1.0 / 20)
+        self.assertAlmostEqual(obj.tokens, expected, places=4)

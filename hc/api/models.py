@@ -1389,22 +1389,26 @@ class TokenBucket(models.Model):
         frozen_now = now()
         obj, created = TokenBucket.objects.get_or_create(value=value)
 
+        # Lock the row to prevent concurrent authorize() calls from reading
+        # stale tokens/updated values. On SQLite this is a no-op; on
+        # PostgreSQL and MySQL it acquires a row-level lock that is held
+        # until the transaction commits.
         if not created:
-            # Top up the bucket:
+            obj = (
+                TokenBucket.objects.filter(pk=obj.pk).select_for_update().get()
+            )
+            # Top up the bucket based on elapsed time:
             duration_secs = (frozen_now - obj.updated).total_seconds()
             obj.tokens = min(1.0, obj.tokens + duration_secs / refill_time_secs)
 
         obj.tokens -= 1.0 / capacity
         if obj.tokens < 0 and not force:
-            # Not enough tokens
+            # Not enough tokens – do not persist, so the next caller still
+            # sees the previous (pre-drain) token count.
             return False
 
-        # Race condition: two concurrent authorize calls can overwrite each
-        # other's changes. It's OK to be a little inexact here for the sake
-        # of simplicity.
         obj.updated = frozen_now
         obj.save()
-
         return True
 
     @staticmethod
