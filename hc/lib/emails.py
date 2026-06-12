@@ -126,6 +126,10 @@ def deletion_notice(to: str, ctx: dict[str, Any]) -> None:
     send(m, block=True)
 
 
+def channel_disabled(to: list[str], ctx: dict[str, Any]) -> None:
+    send(make_message("channel-disabled", to, ctx))
+
+
 def deletion_scheduled(to: list[str], ctx: dict[str, Any]) -> None:
     m = make_message("deletion-scheduled", to, ctx)
     send(m, block=True)

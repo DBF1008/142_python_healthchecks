@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import socket
 import uuid
 from collections.abc import Sequence
@@ -32,7 +33,18 @@ from hc.api import transports
 from hc.lib import emails
 from hc.lib.date import month_boundaries, seconds_in_month
 from hc.lib.s3 import GetObjectError, get_object, put_object, remove_objects
+from hc.lib.statsd import statsd
 from hc.lib.urls import absolute_reverse
+
+logger = logging.getLogger(__name__)
+
+# Exponential backoff schedule for automatically re-enabling channels that were
+# disabled by a permanent transport error. The Nth automatic recovery attempt
+# waits RECOVERY_SCHEDULE[N] after the channel was disabled. After
+# MAX_RECOVERY_ATTEMPTS attempts we stop auto-recovering and rely on the user
+# re-enabling the channel manually (see the recoverchannels management command).
+RECOVERY_SCHEDULE = [td(hours=1), td(hours=6), td(hours=24)]
+MAX_RECOVERY_ATTEMPTS = len(RECOVERY_SCHEDULE)
 
 STATUSES = (("up", "Up"), ("down", "Down"), ("new", "New"), ("paused", "Paused"))
 DEFAULT_TIMEOUT = td(days=1)
@@ -991,6 +1003,9 @@ class Channel(models.Model):
     value = models.TextField(blank=True)
     email_verified = models.BooleanField(default=False)
     disabled = models.BooleanField(default=False)
+    disabled_at = models.DateTimeField(null=True, blank=True)
+    recovery_attempts = models.PositiveSmallIntegerField(default=0)
+    disable_notified = models.BooleanField(default=False)
     last_notify = models.DateTimeField(null=True, blank=True)
     last_notify_duration = models.DurationField(null=True, blank=True)
     last_error = models.CharField(max_length=200, blank=True)
@@ -1129,23 +1144,101 @@ class Channel(models.Model):
         n.error = "Sending"
         n.save()
 
-        start, error, disabled = now(), "", self.disabled
+        start = now()
+        error, permanent = "", False
         try:
             self.transport.notify(flip, notification=n)
 
         except transports.TransportError as e:
-            disabled = True if e.permanent else disabled
             error = e.message
+            permanent = e.permanent
+
+        fields: dict[str, Any] = {
+            "last_notify": start,
+            "last_notify_duration": now() - start,
+            "last_error": error,
+        }
+
+        if not error:
+            # Channel delivered successfully. If it was disabled or in a
+            # recovering state, fully clear the recovery bookkeeping (and
+            # re-enable it) so it resumes normal operation. For a healthy,
+            # never-failed channel all of these are already falsy: no-op.
+            if (
+                self.disabled
+                or self.disabled_at
+                or self.recovery_attempts
+                or self.disable_notified
+            ):
+                fields["disabled"] = False
+                fields["disabled_at"] = None
+                fields["recovery_attempts"] = 0
+                fields["disable_notified"] = False
+        elif permanent and not self.disabled:
+            # A permanent error on a currently-enabled channel. Disable it and
+            # record when, so the recoverchannels command can retry it later
+            # with exponential backoff. Notify the project team once per
+            # disable transition; skip this for test notifications (the user is
+            # actively testing and already sees the result in the UI).
+            fields["disabled"] = True
+            fields["disabled_at"] = start
+            if not self.disable_notified and not is_test:
+                self._send_disabled_notice(error)
+                fields["disable_notified"] = True
 
         Notification.objects.filter(id=n.id).update(error=error)
-        Channel.objects.filter(id=self.id).update(
-            last_notify=start,
-            last_notify_duration=now() - start,
-            last_error=error,
-            disabled=disabled,
-        )
+        Channel.objects.filter(id=self.id).update(**fields)
 
         return error
+
+    def _send_disabled_notice(self, error: str) -> None:
+        """Email the project team that this channel was disabled.
+
+        Any failure here is logged but must not interrupt the notification flow.
+        """
+        recipients = self.project.team_emails()
+        if not recipients:
+            return
+
+        ctx = {
+            "channel": str(self),
+            "kind": self.get_kind_display(),
+            "project": self.project.name,
+            "last_error": error,
+            "channels_url": absolute_reverse("hc-channels", args=[self.project.code]),
+        }
+        try:
+            emails.channel_disabled(recipients, ctx)
+        except Exception as e:
+            logger.error("Failed to send channel-disabled notice", exc_info=e)
+
+    def next_recovery_at(self) -> datetime | None:
+        """Return when this disabled channel is next eligible for auto-recovery.
+
+        Returns None if the channel has no recorded disable time, or has
+        exhausted its automatic recovery attempts (in which case it must be
+        re-enabled manually).
+        """
+        if self.disabled_at is None:
+            return None
+        if self.recovery_attempts >= MAX_RECOVERY_ATTEMPTS:
+            return None
+        return self.disabled_at + RECOVERY_SCHEDULE[self.recovery_attempts]
+
+    def enable(self) -> None:
+        """Re-enable the channel and reset its recovery bookkeeping."""
+        self.disabled = False
+        self.disabled_at = None
+        self.recovery_attempts = 0
+        self.disable_notified = False
+        self.last_error = ""
+        Channel.objects.filter(id=self.id).update(
+            disabled=False,
+            disabled_at=None,
+            recovery_attempts=0,
+            disable_notified=False,
+            last_error="",
+        )
 
     def icon_path(self) -> str:
         return f"img/{self.kind}.png"
@@ -1364,6 +1457,17 @@ class Flip(models.Model):
 
         if self.new_status not in ("up", "down"):
             raise NotImplementedError(f"Unexpected status: {self.new_status}")
+
+        # Count channels excluded solely because they are disabled, so dropped
+        # notifications are observable instead of being silently swallowed.
+        disabled_count = self.owner.channel_set.filter(disabled=True).count()
+        if disabled_count:
+            logger.warning(
+                "select_channels: skipping %d disabled channel(s) for check %s",
+                disabled_count,
+                self.owner.code,
+            )
+            statsd.incr("hc.sendalerts.skippedDisabledChannels", disabled_count)
 
         q = self.owner.channel_set.exclude(disabled=True)
         q = q.order_by(F("last_notify_duration").asc(nulls_last=True))

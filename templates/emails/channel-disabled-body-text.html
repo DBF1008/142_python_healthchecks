@@ -1,0 +1,15 @@
+{% load hc_extras %}Hello,
+
+A notification channel in your {% site_name %} project "{{ project }}" has been automatically disabled after a delivery failure, so it is no longer sending alerts.
+
+Channel: {{ channel }} ({{ kind }})
+Project: {{ project }}
+Error: {{ last_error }}
+
+{% site_name %} will automatically try to re-enable this channel a few more times using an increasing delay. If the underlying problem is fixed (for example, an updated API token or a recovered endpoint), the channel will resume sending alerts on its own.
+
+If you have already fixed the problem, you can re-enable the channel immediately here:
+{{ channels_url }}
+
+--
+The {% site_name %} Team
