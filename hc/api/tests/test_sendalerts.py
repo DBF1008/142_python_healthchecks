@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import timedelta as td
 from unittest.mock import Mock, patch
 
+from cronsim import CronSimError
 from django.utils.timezone import now
 
 from hc.api.management.commands.sendalerts import Command, notify
@@ -46,6 +47,34 @@ class SendAlertsTestCase(BaseTestCase):
         check.refresh_from_db()
         self.assertEqual(check.status, "down")
         self.assertEqual(check.alert_after, None)
+
+    @patch("hc.api.management.commands.sendalerts.logger")
+    @patch("hc.api.models.Check.get_status")
+    def test_it_handles_exception_in_get_status(
+        self, mock_get_status: Mock, mock_logger: Mock
+    ) -> None:
+        # Simulate a check with an invalid schedule: get_status() raises.
+        mock_get_status.side_effect = CronSimError("Test error")
+
+        check = Check(project=self.project, status="up")
+        check.last_ping = now() - td(days=2)
+        check.alert_after = check.last_ping + td(days=1, hours=1)
+        check.save()
+
+        # It should swallow the exception and report it found work, so the
+        # main loop keeps processing the remaining checks instead of crashing:
+        result = Command().handle_going_down()
+        self.assertTrue(result)
+
+        # It should log the error instead of propagating it:
+        self.assertEqual(mock_logger.error.call_count, 1)
+
+        check.refresh_from_db()
+        # It should push alert_after into the future to avoid a crash loop:
+        self.assertGreater(check.alert_after, now())
+        # It should leave the status unchanged and not create a Flip:
+        self.assertEqual(check.status, "up")
+        self.assertEqual(Flip.objects.count(), 0)
 
     @patch("hc.api.management.commands.sendalerts.statsd")
     @patch("hc.api.management.commands.sendalerts.notify")
