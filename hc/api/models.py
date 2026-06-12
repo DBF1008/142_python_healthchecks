@@ -1387,23 +1387,29 @@ class TokenBucket(models.Model):
         value: str, capacity: int, refill_time_secs: int, force: bool = False
     ) -> bool:
         frozen_now = now()
-        obj, created = TokenBucket.objects.get_or_create(value=value)
+        with transaction.atomic():
+            # select_for_update() locks this bucket's row for the duration of
+            # the transaction, so concurrent authorize() calls for the same
+            # value are serialized and cannot overwrite each other's token
+            # deductions (no lost updates). On databases without row-level
+            # locking (e.g. SQLite) the surrounding atomic transaction
+            # serializes the read-modify-write instead.
+            obj, created = TokenBucket.objects.select_for_update().get_or_create(
+                value=value
+            )
 
-        if not created:
-            # Top up the bucket:
-            duration_secs = (frozen_now - obj.updated).total_seconds()
-            obj.tokens = min(1.0, obj.tokens + duration_secs / refill_time_secs)
+            if not created:
+                # Top up the bucket:
+                duration_secs = (frozen_now - obj.updated).total_seconds()
+                obj.tokens = min(1.0, obj.tokens + duration_secs / refill_time_secs)
 
-        obj.tokens -= 1.0 / capacity
-        if obj.tokens < 0 and not force:
-            # Not enough tokens
-            return False
+            obj.tokens -= 1.0 / capacity
+            if obj.tokens < 0 and not force:
+                # Not enough tokens
+                return False
 
-        # Race condition: two concurrent authorize calls can overwrite each
-        # other's changes. It's OK to be a little inexact here for the sake
-        # of simplicity.
-        obj.updated = frozen_now
-        obj.save()
+            obj.updated = frozen_now
+            obj.save()
 
         return True
 
