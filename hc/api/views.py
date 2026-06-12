@@ -167,6 +167,129 @@ def format_first_error(exc: ValidationError) -> str:
     return "json validation error: " + tmpl % subject
 
 
+# --- Batch operation support ---
+
+BATCH_LIMIT = 100
+
+
+class BatchRequest(BaseModel):
+    """Targeting selector for batch pause/resume/delete operations."""
+
+    uuids: list[str] | None = Field(None, max_length=BATCH_LIMIT)
+    tags: list[str] | None = Field(None, max_length=20)
+    all: bool | None = None
+
+    @model_validator(mode="after")
+    def check_exactly_one_selector(self) -> BatchRequest:
+        selectors = sum(
+            [self.uuids is not None, self.tags is not None, self.all is True]
+        )
+        if selectors != 1:
+            raise ValueError("specify exactly one of: uuids, tags, all")
+        return self
+
+
+class BatchUpdateRequest(BaseModel):
+    """Targeting selector + fields for batch update operations."""
+
+    # Targeting (exactly one required)
+    uuids: list[str] | None = Field(None, max_length=BATCH_LIMIT)
+    tags: list[str] | None = Field(None, max_length=20)
+    all: bool | None = None
+    # Updatable fields
+    channels: str | None = None
+    grace: td | None = Field(None, ge=60, le=31536000)
+    timeout: td | None = Field(None, ge=60, le=31536000)
+
+    @model_validator(mode="after")
+    def check_exactly_one_selector(self) -> BatchUpdateRequest:
+        selectors = sum(
+            [self.uuids is not None, self.tags is not None, self.all is True]
+        )
+        if selectors != 1:
+            raise ValueError("specify exactly one of: uuids, tags, all")
+        return self
+
+    @model_validator(mode="after")
+    def check_at_least_one_update_field(self) -> BatchUpdateRequest:
+        if self.channels is None and self.grace is None and self.timeout is None:
+            raise ValueError("specify at least one of: channels, grace, timeout")
+        return self
+
+    @field_validator("timeout", "grace", mode="before")
+    @classmethod
+    def convert_to_timedelta(cls, v: Any) -> Any:
+        if isinstance(v, int):
+            return td(seconds=v)
+        return v
+
+
+def _format_batch_validation_error(exc: ValidationError) -> str:
+    first_error = exc.errors()[0]
+    error_type = first_error["type"]
+    loc = first_error["loc"]
+
+    if error_type == "value_error":
+        return "json validation error: " + first_error["msg"]
+
+    subject = str(loc[0]) if loc else "request"
+    if error_type in CUSTOM_ERRORS:
+        return "json validation error: " + CUSTOM_ERRORS[error_type] % subject
+    return f"json validation error: {subject} is invalid"
+
+
+def _resolve_batch_targets(
+    project: Project,
+    uuids: list[str] | None,
+    tags: list[str] | None,
+    all_checks: bool | None,
+) -> list[Check] | JsonResponse:
+    """Resolve targeting criteria to a list of Check objects.
+
+    Returns either a list of Check objects, or a JsonResponse error.
+    """
+    q = Check.objects.filter(project=project)
+
+    if uuids is not None:
+        try:
+            uuid_objects = [UUID(u) for u in uuids]
+        except ValueError:
+            return error("invalid UUID in uuids list")
+
+        q = q.filter(code__in=uuid_objects)
+        checks = list(q)
+
+        found_codes = {c.code for c in checks}
+        missing = [str(u) for u in uuid_objects if u not in found_codes]
+        if missing:
+            return error(f"check not found: {missing[0]}", 404)
+
+    elif tags is not None:
+        if len(tags) == 0:
+            return error("tags list must not be empty")
+        tag_set = set(tags)
+        for tag in tag_set:
+            q = q.filter(tags__contains=tag)
+        checks = [c for c in q if c.matches_tag_set(tag_set)]
+
+    elif all_checks is True:
+        checks = list(q)
+
+    else:
+        return error("missing targeting criteria")
+
+    if len(checks) == 0:
+        return error("no matching checks found")
+
+    if len(checks) > BATCH_LIMIT:
+        return error(
+            f"too many matching checks ({len(checks)}). "
+            f"Maximum is {BATCH_LIMIT}."
+        )
+
+    return checks
+
+
 def valid_ip(ip: str) -> bool:
     try:
         ip_address(ip)
@@ -591,6 +714,197 @@ def resume(request: ApiRequest, code: UUID) -> HttpResponse:
     check.save()
 
     return JsonResponse(check.to_dict(v=request.v))
+
+
+# --- Batch operations ---
+
+
+@authorize
+def batch_pause_action(request: ApiRequest) -> HttpResponse:
+    try:
+        body = BatchRequest.model_validate(request.json, strict=True)
+    except ValidationError as e:
+        return error(_format_batch_validation_error(e))
+
+    result = _resolve_batch_targets(
+        request.project, body.uuids, body.tags, body.all
+    )
+    if isinstance(result, JsonResponse):
+        return result
+    checks = result
+
+    with transaction.atomic():
+        locked_ids = [c.id for c in checks]
+        checks = list(
+            Check.objects.select_for_update().filter(
+                id__in=locked_ids, project=request.project
+            )
+        )
+
+        for check in checks:
+            if check.status == "paused":
+                continue  # Idempotent: already paused, skip
+            check.create_flip("paused", mark_as_processed=True)
+            check.status = "paused"
+            check.last_start = None
+            check.alert_after = None
+            check.save()
+
+        request.project.update_next_nag_dates()
+
+    return JsonResponse(
+        {
+            "count": len(checks),
+            "checks": [c.to_dict(v=request.v) for c in checks],
+        }
+    )
+
+
+@authorize
+def batch_resume_action(request: ApiRequest) -> HttpResponse:
+    try:
+        body = BatchRequest.model_validate(request.json, strict=True)
+    except ValidationError as e:
+        return error(_format_batch_validation_error(e))
+
+    result = _resolve_batch_targets(
+        request.project, body.uuids, body.tags, body.all
+    )
+    if isinstance(result, JsonResponse):
+        return result
+    checks = result
+
+    with transaction.atomic():
+        locked_ids = [c.id for c in checks]
+        checks = list(
+            Check.objects.select_for_update().filter(
+                id__in=locked_ids, project=request.project
+            )
+        )
+
+        # Pre-validate: ALL checks must be paused before any modifications
+        for check in checks:
+            if check.status != "paused":
+                return HttpResponse(
+                    f"check {check.code} is not paused", status=409
+                )
+
+        for check in checks:
+            check.create_flip("new", mark_as_processed=True)
+            check.status = "new"
+            check.last_start = None
+            check.last_ping = None
+            check.alert_after = None
+            check.save()
+
+    return JsonResponse(
+        {
+            "count": len(checks),
+            "checks": [c.to_dict(v=request.v) for c in checks],
+        }
+    )
+
+
+@authorize
+def batch_delete_action(request: ApiRequest) -> HttpResponse:
+    try:
+        body = BatchRequest.model_validate(request.json, strict=True)
+    except ValidationError as e:
+        return error(_format_batch_validation_error(e))
+
+    result = _resolve_batch_targets(
+        request.project, body.uuids, body.tags, body.all
+    )
+    if isinstance(result, JsonResponse):
+        return result
+    checks = result
+
+    with transaction.atomic():
+        locked_ids = [c.id for c in checks]
+        checks = list(
+            Check.objects.select_for_update().filter(
+                id__in=locked_ids, project=request.project
+            )
+        )
+
+        # Serialize before deletion (need the dicts for the response)
+        check_dicts = [c.to_dict(v=request.v) for c in checks]
+
+        for check in checks:
+            check.rename_and_delete()
+
+    return JsonResponse({"count": len(check_dicts), "checks": check_dicts})
+
+
+@authorize
+def batch_update_action(request: ApiRequest) -> HttpResponse:
+    try:
+        body = BatchUpdateRequest.model_validate(request.json, strict=True)
+    except ValidationError as e:
+        return error(_format_batch_validation_error(e))
+
+    result = _resolve_batch_targets(
+        request.project, body.uuids, body.tags, body.all
+    )
+    if isinstance(result, JsonResponse):
+        return result
+    checks = result
+
+    # Build a Spec from the batch update fields
+    spec_data: dict[str, Any] = {}
+    if body.channels is not None:
+        spec_data["channels"] = body.channels
+    if body.grace is not None:
+        spec_data["grace"] = int(body.grace.total_seconds())
+    if body.timeout is not None:
+        spec_data["timeout"] = int(body.timeout.total_seconds())
+
+    spec = Spec.model_validate(spec_data, strict=True)
+
+    with transaction.atomic():
+        locked_ids = [c.id for c in checks]
+        checks = list(
+            Check.objects.select_for_update().filter(
+                id__in=locked_ids, project=request.project
+            )
+        )
+
+        for check in checks:
+            try:
+                _update(check, spec, request.v)
+            except BadChannelException as e:
+                return JsonResponse({"error": e.message}, status=400)
+
+    return JsonResponse(
+        {
+            "count": len(checks),
+            "checks": [c.to_dict(v=request.v) for c in checks],
+        }
+    )
+
+
+@csrf_exempt
+@cors("POST")
+def batch_pause(request: HttpRequest) -> HttpResponse:
+    return batch_pause_action(request)
+
+
+@csrf_exempt
+@cors("POST")
+def batch_resume(request: HttpRequest) -> HttpResponse:
+    return batch_resume_action(request)
+
+
+@csrf_exempt
+@cors("POST")
+def batch_delete(request: HttpRequest) -> HttpResponse:
+    return batch_delete_action(request)
+
+
+@csrf_exempt
+@cors("POST")
+def batch_update(request: HttpRequest) -> HttpResponse:
+    return batch_update_action(request)
 
 
 @cors("GET")
