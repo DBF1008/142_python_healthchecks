@@ -123,7 +123,7 @@ class Command(BaseCommand):
 
         1. Find a check with alert_after in the past, and status other than "down".
         2. Calculate its current status.
-        3. If calculation throws an exception, push alert_after forward and re-raise.
+        3. If calculation throws an exception, push alert_after forward and continue.
         4. If the current status is not "down", update alert_after and return.
         5. Update the check's status in the database to "down".
         6. If exactly 1 row gets updated, create a Flip object.
@@ -145,8 +145,8 @@ class Command(BaseCommand):
             # Make sure we don't trip on this check again for an hour:
             # Otherwise sendalerts may end up in a crash loop.
             q.update(alert_after=now() + td(hours=1))
-            # Then re-raise the exception:
-            raise e
+            logger.error("get_status() failed for check %s: %s", check.code, e)
+            return True
 
         if status != "down":
             # It is not down yet. Update alert_after
